@@ -1,0 +1,585 @@
+if getgenv and getgenv().XitadoRayCleanup then pcall(getgenv().XitadoRayCleanup) end
+if getgenv and getgenv().XitadoRayWindow then
+    pcall(function() getgenv().XitadoRayWindow:Destroy() end)
+    getgenv().XitadoRayWindow = nil
+end
+
+local Players             = game:GetService("Players")
+local RunService          = game:GetService("RunService")
+local Workspace           = game:GetService("Workspace")
+local UserInputService    = game:GetService("UserInputService")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+
+local player = Players.LocalPlayer
+
+local WindUI = loadstring(game:HttpGet("https://github.com/Footagesus/WindUI/releases/latest/download/main.lua"))()
+
+local state = {
+    autoShot    = false,
+    silentAim   = false,
+    target      = "Torso",
+    fovEnabled  = false,
+    fovSize     = 180,
+    destroyed   = false,
+    randomMode  = false,
+    fovColorIdx = 1,
+    hitChance   = 100,
+    safeFriends = {},
+}
+local fovColors = {
+    [1] = Color3.fromRGB(255, 255, 255),
+    [2] = Color3.fromRGB(255, 0, 0),
+    [3] = Color3.fromRGB(0, 255, 0),
+    [4] = Color3.fromRGB(0, 150, 255),
+    [5] = Color3.fromRGB(255, 0, 255),
+    [6] = Color3.fromRGB(150, 0, 255),
+    [7] = Color3.fromRGB(255, 255, 0),
+    [8] = Color3.fromRGB(0, 255, 255)
+}
+
+getgenv().XitadoRayTargetPart = nil
+getgenv().XitadoRayHitPos     = nil
+
+local AIM_INTERVAL     = 0.15
+local MAX_AIM_DISTANCE = 500
+local SHOOT_COOLDOWN   = 0.18
+local lastShoot        = 0
+
+local connections = {}
+local function track(conn)
+    if conn then connections[#connections + 1] = conn end
+    return conn
+end
+
+local drawingOK = type(Drawing) == "table" and Drawing.new ~= nil
+local fovCircle = nil
+
+local function buildFovCircle()
+    if not drawingOK then return end
+    if fovCircle then pcall(function() fovCircle:Remove() end) end
+    local ok, c = pcall(function() return Drawing.new("Circle") end)
+    if not ok then return end
+    fovCircle              = c
+    fovCircle.Visible      = false
+    fovCircle.Thickness    = 1.5
+    fovCircle.Color        = fovColors[1]
+    fovCircle.Filled       = false
+    fovCircle.Transparency = 1
+    fovCircle.NumSides     = 64
+    fovCircle.Radius       = state.fovSize
+end
+buildFovCircle()
+
+track(RunService.RenderStepped:Connect(function()
+    if state.destroyed or not fovCircle then return end
+    local cam = Workspace.CurrentCamera
+    if not cam then return end
+    local vp = cam.ViewportSize
+    fovCircle.Position = Vector2.new(vp.X / 2, vp.Y / 2)
+    fovCircle.Radius   = state.fovSize
+    fovCircle.Visible  = state.fovEnabled
+    fovCircle.Color    = fovColors[state.fovColorIdx]
+end))
+
+local function inFov(part)
+    if not state.fovEnabled then return true end
+    if not part or not part.Parent then return false end
+    local cam = Workspace.CurrentCamera
+    if not cam then return false end
+    local vp = cam.ViewportSize
+    local sp, vis = cam:WorldToViewportPoint(part.Position)
+    if not vis or sp.Z <= 0 then return false end
+    local center = Vector2.new(vp.X / 2, vp.Y / 2)
+    local screen = Vector2.new(sp.X, sp.Y)
+    return (screen - center).Magnitude <= state.fovSize
+end
+
+local function validTarget(plr)
+    if not plr or plr == player then return false end
+    
+    if state.safeFriends[plr.Name] or state.safeFriends[plr.DisplayName] then
+        return false
+    end
+
+    local char = plr.Character
+    if not char then return false end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not hum or hum.Health <= 0 then return false end
+    if char:FindFirstChildOfClass("ForceField") then return false end
+    return true
+end
+
+local function inLobby()
+    local char = player.Character
+    if not char then return true end
+    if char:FindFirstChildOfClass("ForceField") then return true end
+    return false
+end
+
+local function isKnife(tool)
+    if not tool or not tool:IsA("Tool") then return false end
+    if tool:FindFirstChild("Slash") or tool:FindFirstChild("SlashStart") then return true end
+    local n = tool.Name:lower()
+    return n:find("knife") or n:find("cuchillo") or n:find("dagger")
+end
+
+local function isGun(tool)
+    if not tool or not tool:IsA("Tool") or isKnife(tool) then return false end
+    if tool:FindFirstChild("GunFire", true) then return true end
+    local n = tool.Name:lower()
+    return n:find("revolver") or n:find("pistol") or n:find("gun")
+end
+
+local function aimParts(char)
+    local out = {}
+    if not char then return out end
+    
+    if state.randomMode then
+        local parts = {}
+        for _, p in ipairs(char:GetChildren()) do
+            if p:IsA("BasePart") and p.Name ~= "HumanoidRootPart" then
+                table.insert(parts, p)
+            end
+        end
+        if #parts > 0 then
+            out[1] = parts[math.random(1, #parts)]
+        else
+            local hrp = char:FindFirstChild("HumanoidRootPart")
+            if hrp then out[1] = hrp end
+        end
+        return out
+    end
+
+    if state.target == "Head" then
+        local h = char:FindFirstChild("Head")
+        if h and h:IsA("BasePart") then out[1] = h end
+    elseif state.target == "Torso" then
+        for _, name in ipairs({ "UpperTorso", "Torso", "HumanoidRootPart" }) do
+            local p = char:FindFirstChild(name)
+            if p and p:IsA("BasePart") then out[#out + 1] = p end
+        end
+    else
+        for _, p in ipairs(char:GetChildren()) do
+            if p:IsA("BasePart") and p.Name ~= "HumanoidRootPart" then out[#out + 1] = p end
+        end
+        if #out == 0 then
+            local hrp = char:FindFirstChild("HumanoidRootPart")
+            if hrp then out[1] = hrp end
+        end
+    end
+    return out
+end
+
+local function partVisible(from, part, myChar, enemyChar, params)
+    if not part or not part.Parent then return false end
+    params.FilterDescendantsInstances = { myChar, enemyChar }
+    local hit = Workspace:Raycast(from, part.Position - from, params)
+    return not hit or (hit.Instance and hit.Instance:IsDescendantOf(enemyChar))
+end
+
+local silentParams = RaycastParams.new()
+silentParams.FilterType = Enum.RaycastFilterType.Exclude
+
+task.spawn(function()
+    while task.wait(AIM_INTERVAL) do
+        if state.destroyed then break end
+        if not state.silentAim or inLobby() then
+            if not state.autoShot then getgenv().XitadoRayTargetPart = nil end
+            continue
+        end
+        local char = player.Character
+        if not char then continue end
+        local hum  = char:FindFirstChildOfClass("Humanoid")
+        local root = char:FindFirstChild("HumanoidRootPart")
+        if not hum or hum.Health <= 0 or not root then continue end
+        local head = char:FindFirstChild("Head")
+        local from = head and head.Position or root.Position
+
+        local hitRoll = math.random(1, 100)
+        if hitRoll > state.hitChance then
+            getgenv().XitadoRayTargetPart = nil
+            continue
+        end
+
+        local best, bestDist = nil, math.huge
+        for _, p in ipairs(Players:GetPlayers()) do
+            if validTarget(p) and p.Character then
+                for _, part in ipairs(aimParts(p.Character)) do
+                    if not inFov(part) then continue end
+                    local d = (part.Position - from).Magnitude
+                    if d <= MAX_AIM_DISTANCE and d < bestDist
+                        and partVisible(from, part, char, p.Character, silentParams) then
+                        best, bestDist = part, d
+                    end
+                end
+            end
+        end
+
+        if best then
+            getgenv().XitadoRayTargetPart = best
+        elseif not state.autoShot then
+            getgenv().XitadoRayTargetPart = nil
+        end
+    end
+end)
+
+local function simulateShoot(tool, char)
+    local done = false
+    local cam  = Workspace.CurrentCamera
+    local pos  = cam and Vector2.new(cam.ViewportSize.X / 2, cam.ViewportSize.Y / 2) or Vector2.new(0, 0)
+    if UserInputService and UserInputService.TouchEnabled then
+        pcall(function()
+            if VirtualInputManager.SendTouchEvent then
+                VirtualInputManager:SendTouchEvent(Enum.TouchState.Began, pos, 1)
+                task.wait(0.05)
+                VirtualInputManager:SendTouchEvent(Enum.TouchState.Ended, pos, 1)
+                done = true
+            end
+        end)
+    end
+    if not done then
+        pcall(function()
+            if VirtualInputManager.SendMouseButtonEvent then
+                VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, true, game, 1)
+                task.wait(0.05)
+                VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 1)
+                done = true
+            end
+        end)
+    end
+    if not done then
+        pcall(function()
+            if mouse1press and mouse1release then
+                mouse1press(); task.wait(0.05); mouse1release(); done = true
+            elseif mouse1click then
+                mouse1click(); done = true
+            end
+        end)
+    end
+    if not done then
+        pcall(function()
+            tool:Activate(); task.wait(0.05)
+            if tool.Parent == char then tool:Deactivate() end
+        end)
+    end
+end
+
+local autoParams = RaycastParams.new()
+autoParams.FilterType = Enum.RaycastFilterType.Exclude
+
+task.spawn(function()
+    while task.wait(AIM_INTERVAL) do
+        if state.destroyed then break end
+        if not state.autoShot or inLobby() then continue end
+        local char = player.Character
+        if not char then continue end
+        local hum  = char:FindFirstChildOfClass("Humanoid")
+        local root = char:FindFirstChild("HumanoidRootPart")
+        if not hum or not root or hum.Health <= 0 then continue end
+
+        local tool = char:FindFirstChildOfClass("Tool")
+        if not isGun(tool) then
+            tool = nil
+            local bp = player:FindFirstChildOfClass("Backpack")
+            if bp then
+                for _, item in ipairs(bp:GetChildren()) do
+                    if isGun(item) then tool = item; break end
+                end
+            end
+        end
+        if not isGun(tool) then continue end
+
+        local head = char:FindFirstChild("Head")
+        local from = head and head.Position or root.Position
+        local best, bestDist   = nil, math.huge
+        local torso, torsoDist = nil, math.huge
+
+        for _, p in ipairs(Players:GetPlayers()) do
+            if validTarget(p) and p.Character then
+                autoParams.FilterDescendantsInstances = { char, p.Character }
+                for _, part in ipairs(p.Character:GetChildren()) do
+                    if part:IsA("BasePart") and part.Name ~= "HumanoidRootPart" then
+                        if not inFov(part) then continue end
+                        local d = (part.Position - from).Magnitude
+                        if d > MAX_AIM_DISTANCE then continue end
+                        local isTorso = part.Name == "UpperTorso" or part.Name == "Torso"
+                        if isTorso then
+                            if d >= torsoDist then continue end
+                        elseif d >= bestDist then
+                            continue
+                        end
+                        local size = part.Size
+                        local offsets = {
+                            Vector3.zero,
+                            Vector3.new(0,  size.Y / 2.1, 0),
+                            Vector3.new(0, -size.Y / 2.1, 0),
+                        }
+                        for _, off in ipairs(offsets) do
+                            if not Workspace:Raycast(from, (part.CFrame * off) - from, autoParams) then
+                                if isTorso then torso, torsoDist = part, d
+                                else             best,  bestDist  = part, d end
+                                break
+                            end
+                        end
+                    end
+                end
+            end
+        end
+
+        best = torso or best
+        if not best or not best.Parent or os.clock() - lastShoot < SHOOT_COOLDOWN then continue end
+
+        if tool.Parent ~= char then
+            pcall(function() hum:EquipTool(tool) end)
+            if tool.Parent ~= char then continue end
+        end
+        task.wait(0.10)
+        if state.destroyed or not best.Parent then
+            pcall(function() hum:UnequipTools() end)
+            continue
+        end
+
+        getgenv().XitadoRayTargetPart = best
+        lastShoot = os.clock()
+        simulateShoot(tool, char)
+        task.wait(0.04)
+        pcall(function() hum:UnequipTools() end)
+    end
+end)
+
+local oldNamecall
+if hookmetamethod and getnamecallmethod and checkcaller then
+    oldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
+        local method = getnamecallmethod()
+        local isRay  = method == "Raycast"
+            or (type(method) == "string" and method:sub(1, 13) == "FindPartOnRay")
+        if isRay and self == Workspace and not checkcaller() then
+            local target = getgenv().XitadoRayTargetPart
+            if target and target.Parent then
+                if method == "Raycast" then
+                    local origin, direction, p3 = ...
+                    if typeof(origin) == "Vector3" and typeof(direction) == "Vector3"
+                        and direction.Magnitude > 20 then
+                        local dir = target.Position - origin
+                        if dir.Magnitude > 0.001 then
+                            local result = oldNamecall(self, origin, dir.Unit * 5000, p3)
+                            if typeof(result) == "RaycastResult" then
+                                getgenv().XitadoRayHitPos = result.Position
+                            end
+                            return result
+                        end
+                    end
+                else
+                    local ray, p2, p3, p4 = ...
+                    if typeof(ray) == "Ray" and ray.Direction.Magnitude > 20 then
+                        local dir = target.Position - ray.Origin
+                        if dir.Magnitude > 0.001 then
+                            local part, pos, normal, mat =
+                                oldNamecall(self, Ray.new(ray.Origin, dir.Unit * 5000), p2, p3, p4)
+                            if typeof(pos) == "Vector3" then
+                                getgenv().XitadoRayHitPos = pos
+                            end
+                            return part, pos, normal, mat
+                        end
+                    end
+                end
+            end
+        end
+        return oldNamecall(self, ...)
+    end)
+end
+
+local Window = WindUI:CreateWindow({
+    Title      = "young0x",
+    Folder     = "XitadoHubWind",
+    Size       = UDim2.fromOffset(420, 280),
+    Draggable  = true,
+    Resizable  = true,
+    OpenButton = { Title = "young0x", Enabled = true, OnlyMobile = false },
+})
+
+pcall(function()
+    local framePrincipal = Window.Main.Frame
+    if framePrincipal then
+        framePrincipal.BackgroundTransparency = 1
+        local bg = Instance.new("ImageLabel")
+        bg.Size = UDim2.new(1, 0, 1, 0)
+        bg.BackgroundTransparency = 1
+        bg.Image = "rbxassetid://90221984997667"
+        bg.ScaleType = Enum.ScaleType.Crop
+        bg.ZIndex = -10
+        bg.Parent = framePrincipal
+    end
+end)
+
+getgenv().XitadoRayWindow = Window
+pcall(function() if Window.Open then Window:Open() end end)
+
+local TabInicio = Window:Tab({ Title = "Inicio:" })
+pcall(function() if Window.SelectTab then Window:SelectTab(TabInicio) end end)
+
+TabInicio:Paragraph({
+    Title = "Créditos:",
+    Desc = "young0x",
+    Color = Color3.fromRGB(255, 255, 255)
+})
+
+local TabCombate = Window:Tab({ Title = "Combate🔫:" })
+
+TabCombate:Section({ Title = "Silent Aim:" })
+
+TabCombate:Toggle({
+    Title    = "Enabled",
+    Value    = false,
+    Callback = function(v)
+        state.silentAim = v == true
+        if not v and not state.autoShot then getgenv().XitadoRayTargetPart = nil end
+    end,
+})
+
+TabCombate:Dropdown({
+    Title    = "Target",
+    Values   = { "Head", "Torso", "Full Body", "Random" },
+    Value    = "Torso",
+    Callback = function(option)
+        local v = tostring(option)
+        if v == "Random" then
+            state.randomMode = true
+        else
+            state.randomMode = false
+            if     v == "Head"      then state.target = "Head"
+            elseif v == "Full Body" then state.target = "FullBody"
+            else                         state.target = "Torso" end
+        end
+    end,
+})
+
+TabCombate:Slider({
+    Title = "Hit Chance (%):",
+    Value = { Min = 1, Max = 100, Default = state.hitChance },
+    Callback = function(val)
+        state.hitChance = val
+    end,
+})
+
+TabCombate:Toggle({
+    Title    = "Show FOV",
+    Value    = false,
+    Callback = function(v)
+        state.fovEnabled = v == true
+        if not v and fovCircle then fovCircle.Visible = false end
+    end,
+})
+
+TabCombate:Slider({
+    Title = "FOV Radius:",
+    Value = { Min = 1, Max = 800, Default = state.fovSize },
+    Callback = function(val)
+        state.fovSize = val
+        if fovCircle then fovCircle.Radius = val end
+    end,
+})
+
+TabCombate:Button({
+    Title = "Cambiar Color FOV",
+    Callback = function()
+        state.fovColorIdx = state.fovColorIdx + 1
+        if state.fovColorIdx > 8 then state.fovColorIdx = 1 end
+        if fovCircle then fovCircle.Color = fovColors[state.fovColorIdx] end
+    end,
+})
+
+TabCombate:Section({ Title = "Safe Friends:" })
+
+-- Función para obtener la lista de jugadores actual
+local function getPlayersList()
+    local list = {}
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= player then
+            table.insert(list, p.Name)
+        end
+    end
+    return list
+end
+
+-- Dropdown dinámico de jugadores
+local PlayerDropdown = TabCombate:Dropdown({
+    Title = "Jugadores en el Servidor:",
+    Values = getPlayersList(),
+    Value = "",
+    Callback = function(option)
+        if option and option ~= "" then
+            state.safeFriends[option] = true
+        end
+    end,
+})
+
+-- Botón para refrescar la lista
+TabCombate:Button({
+    Title = "Refrescar Lista",
+    Callback = function()
+        if PlayerDropdown and PlayerDropdown.SetValues then
+            PlayerDropdown:SetValues(getPlayersList())
+        end
+    end,
+})
+
+TabCombate:Input({
+    Title = "Agregar Manualmente:",
+    Placeholder = "Escribe el nombre...",
+    Callback = function(text)
+        if text and text ~= "" then
+            state.safeFriends[text] = true
+        end
+    end,
+})
+
+TabCombate:Button({
+    Title = "Limpiar Lista de Amigos",
+    Callback = function()
+        state.safeFriends = {}
+    end,
+})
+
+TabCombate:Section({ Title = "Auto Shoot:" })
+
+TabCombate:Toggle({
+    Title    = "Enabled",
+    Value    = false,
+    Callback = function(v) state.autoShot = v == true end,
+})
+
+TabCombate:Section({ Title = "Macro:" })
+
+TabCombate:Button({
+    Title = "Abrir Macro",
+    Callback = function()
+        pcall(function()
+            loadstring(game:HttpGet("https://raw.githubusercontent.com/thiagobanchero2-web/Macro-young0x-/refs/heads/main/Macro"))()
+        end)
+    end,
+})
+
+TabCombate:Button({
+    Title = "Cerrar Macro",
+    Callback = function()
+        local targetParent = (gethui and gethui()) or game:GetService("CoreGui") or player:WaitForChild("PlayerGui")
+        if targetParent:FindFirstChild("Young0xTrackpad_V4") then
+            targetParent.Young0xTrackpad_V4:Destroy()
+        end
+    end,
+})
+
+getgenv().XitadoRayCleanup = function()
+    state.destroyed  = true
+    state.autoShot   = false
+    state.silentAim  = false
+    state.fovEnabled = false
+    getgenv().XitadoRayTargetPart = nil
+    getgenv().XitadoRayHitPos     = nil
+    for _, conn in ipairs(connections) do pcall(function() conn:Disconnect() end) end
+    table.clear(connections)
+    if oldNamecall then pcall(function() hookmetamethod(game, "__namecall", oldNamecall) end) end
+    if fovCircle   then pcall(function() fovCircle:Remove() end) end
+    getgenv().XitadoRayCleanup = nil
+end
